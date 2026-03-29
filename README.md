@@ -1,6 +1,6 @@
-# Gong MCP Server
+# Gong MCP 
 
-An MCP (Model Context Protocol) server that exposes Gong call data to Claude Desktop. Part of the PM Signal Intelligence system.
+An MCP that exposes Gong call data to Claude Desktop. Part of the PM Signal Intelligence system.
 
 ## What it does
 
