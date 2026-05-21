@@ -4,12 +4,13 @@ An MCP that exposes Gong call data to Claude Desktop. Part of the PM Signal Inte
 
 ## What it does
 
-Exposes four tools to Claude:
+Exposes five tools to Claude:
 
-1. **list_calls** — List calls by date range. Returns call IDs, titles, dates, durations.
-2. **get_call_details** — Get participants with names, titles, emails, and internal/external classification.
-3. **get_transcripts** — Get full transcripts segmented by speaker with timestamps. Speaker IDs are mapped to names.
-4. **search_calls** — Search for keywords across transcripts in a date range. Returns matching segments with speaker and timestamp context.
+1. **list_calls** — List calls by date range (auto-paginates across Gong's cursor). Returns call IDs, titles, dates, durations.
+2. **get_call_details** — Get participants with names, titles, emails, and internal/external classification, plus topics and trackers.
+3. **get_transcripts** — Get full transcripts segmented by speaker with timestamps. Match `speakerId` against participants from `get_call_details`.
+4. **search_calls** — Search for keywords across transcripts in a date range. Returns matching segments with speaker and timestamp context. Optional `maxCalls` (default 50, max 200) bounds how many calls are scanned.
+5. **get_users** — List Gong users (id, name, email, title). Use to map speaker IDs to people.
 
 ## Prerequisites
 
@@ -21,7 +22,6 @@ Exposes four tools to Claude:
 ### 1. Install dependencies
 
 ```bash
-cd gong-mcp-server
 npm install
 ```
 
@@ -74,6 +74,7 @@ In Settings > Connectors > gong, set tool permissions:
 - get_call_details: **Allow**
 - get_transcripts: **Allow**
 - search_calls: **Allow**
+- get_users: **Allow**
 
 ## Usage in Claude
 
@@ -95,15 +96,16 @@ Once connected, Claude can use the Gong tools directly:
 
 ## API rate limits
 
-Gong's API has rate limits. The server handles 429 responses by returning an error message with the retry-after duration. If you see rate limit errors during large backfills, reduce the `max_calls` parameter on search_calls or process calls in smaller batches.
+Gong's API has rate limits. The server retries 429 responses up to 3 times with exponential backoff, honoring `Retry-After` when present. If you still see rate-limit errors during large backfills, reduce `maxCalls` on `search_calls` or narrow the date range.
 
 ## Gong API reference
 
 The server uses these Gong v2 endpoints:
 
-- `GET /v2/calls` — list calls by date range
+- `GET /v2/calls` — list calls by date range (cursor-paginated)
 - `POST /v2/calls/extensive` — get detailed call data with participants
 - `POST /v2/calls/transcript` — get call transcripts
+- `GET /v2/users` — list users (cursor-paginated)
 
 Full API documentation: https://gong.app.gong.io/settings/api/documentation
 
@@ -124,5 +126,5 @@ Full API documentation: https://gong.app.gong.io/settings/api/documentation
 - Some Gong plans restrict API access. Confirm your plan includes API access.
 
 **Rate limit errors:**
-- Reduce batch sizes. The search_calls tool has a `max_calls` parameter.
-- Add delays between large requests.
+- Reduce batch sizes. The `search_calls` tool has a `maxCalls` parameter (default 50).
+- Narrow the date range so fewer calls are paginated.
