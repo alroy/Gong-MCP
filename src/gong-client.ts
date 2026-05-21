@@ -5,9 +5,10 @@
  * Base URL: https://api.gong.io/v2
  *
  * Endpoints used:
- *   GET  /v2/calls                  — list calls by date range
+ *   GET  /v2/calls                  — list calls by date range (cursor-paginated)
  *   POST /v2/calls/extensive        — get detailed call data with participants
  *   POST /v2/calls/transcript       — get call transcripts
+ *   GET  /v2/users                  — list users (cursor-paginated)
  */
 
 export interface GongConfig {
@@ -27,7 +28,7 @@ export interface GongCall {
 }
 
 export interface GongParticipant {
-  id: string;
+  id?: string;
   name: string;
   emailAddress?: string;
   title?: string;
@@ -46,7 +47,12 @@ export interface GongCallDetailed {
     direction: string;
     scope: string;
   };
-  parties: GongParticipant[];
+  parties?: GongParticipant[];
+  content?: {
+    topics?: Array<{ name: string; duration?: number }>;
+    trackers?: Array<{ name: string; count?: number }>;
+    pointsOfInterest?: unknown[];
+  };
 }
 
 export interface GongTranscriptEntry {
@@ -64,6 +70,18 @@ export interface GongCallTranscript {
   transcript: GongTranscriptEntry[];
 }
 
+export interface GongUser {
+  id: string;
+  emailAddress?: string;
+  firstName?: string;
+  lastName?: string;
+  title?: string | null;
+  managerId?: string | null;
+  active?: boolean;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 export class GongClient {
   private baseUrl: string;
   private authHeader: string;
@@ -79,7 +97,8 @@ export class GongClient {
   private async request<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    attempt = 0
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const options: RequestInit = {
@@ -89,29 +108,35 @@ export class GongClient {
         "Content-Type": "application/json",
       },
     };
-    if (body) {
+    if (body !== undefined) {
       options.body = JSON.stringify(body);
     }
 
     const response = await fetch(url, options);
 
     if (response.status === 429) {
-      const retryAfter = response.headers.get("Retry-After");
-      throw new Error(
-        `Gong API rate limited. Retry after ${retryAfter || "unknown"} seconds.`
-      );
+      if (attempt < 3) {
+        const retryAfterRaw = response.headers.get("Retry-After");
+        const retryAfterSec = retryAfterRaw ? parseFloat(retryAfterRaw) : NaN;
+        const waitMs = Number.isFinite(retryAfterSec)
+          ? Math.max(retryAfterSec * 1000, 500)
+          : Math.min(8000, 1000 * Math.pow(2, attempt));
+        await sleep(waitMs);
+        return this.request<T>(method, path, body, attempt + 1);
+      }
+      throw new Error(`Gong API rate limited after ${attempt + 1} attempts.`);
     }
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`Gong API error ${response.status}: ${text}`);
+      throw new Error(`Gong API ${method} ${path} failed (${response.status}): ${text}`);
     }
 
     return response.json() as Promise<T>;
   }
 
   /**
-   * List calls within a date range.
+   * Single-page call listing. Use listAllCalls to auto-paginate.
    * GET /v2/calls?fromDateTime=...&toDateTime=...
    */
   async listCalls(
@@ -119,28 +144,13 @@ export class GongClient {
     toDateTime: string,
     cursor?: string
   ): Promise<{ calls: GongCall[]; cursor?: string; totalRecords: number }> {
-    let path = `/calls?fromDateTime=${encodeURIComponent(fromDateTime)}&toDateTime=${encodeURIComponent(toDateTime)}`;
-    if (cursor) {
-      path += `&cursor=${encodeURIComponent(cursor)}`;
-    }
+    const params = new URLSearchParams({ fromDateTime, toDateTime });
+    if (cursor) params.set("cursor", cursor);
 
     const data = await this.request<{
-      requestId: string;
-      records: {
-        totalRecords: number;
-        currentPageSize: number;
-        cursor?: string;
-      };
-      calls: Array<{
-        id: string;
-        title: string;
-        started: string;
-        duration: number;
-        direction: string;
-        primaryUserId: string;
-        url: string;
-      }>;
-    }>("GET", path);
+      records?: { totalRecords?: number; currentPageSize?: number; cursor?: string };
+      calls?: GongCall[];
+    }>("GET", `/calls?${params.toString()}`);
 
     return {
       calls: data.calls || [],
@@ -150,67 +160,95 @@ export class GongClient {
   }
 
   /**
-   * Get detailed call data including participants.
+   * List all calls in a date range, auto-paginating. Caps pages to bound
+   * latency and rate-limit usage; sets truncated=true when the cap is hit.
+   */
+  async listAllCalls(
+    fromDateTime: string,
+    toDateTime: string,
+    maxPages = 20
+  ): Promise<{ calls: GongCall[]; truncated: boolean; totalRecords: number }> {
+    const all: GongCall[] = [];
+    let cursor: string | undefined;
+    let totalRecords = 0;
+    let page = 0;
+    do {
+      const data = await this.listCalls(fromDateTime, toDateTime, cursor);
+      all.push(...data.calls);
+      totalRecords = data.totalRecords || totalRecords;
+      cursor = data.cursor;
+      page++;
+    } while (cursor && page < maxPages);
+
+    return { calls: all, truncated: Boolean(cursor), totalRecords };
+  }
+
+  /**
+   * Detailed call data including participants, topics, trackers.
    * POST /v2/calls/extensive
    */
   async getCallDetails(callIds: string[]): Promise<GongCallDetailed[]> {
-    const data = await this.request<{
-      requestId: string;
-      records: { totalRecords: number; currentPageSize: number };
-      calls: GongCallDetailed[];
-    }>("POST", "/calls/extensive", {
-      filter: { callIds },
-      contentSelector: {
-        exposedFields: {
-          parties: true,
-          content: {
-            trackers: false,
-            topics: true,
-            pointsOfInterest: false,
+    const data = await this.request<{ calls?: GongCallDetailed[] }>(
+      "POST",
+      "/calls/extensive",
+      {
+        filter: { callIds },
+        contentSelector: {
+          exposedFields: {
+            parties: true,
+            content: {
+              structure: true,
+              topics: true,
+              trackers: true,
+              pointsOfInterest: true,
+            },
+            collaboration: { publicComments: true },
           },
         },
-      },
-    });
-
+      }
+    );
     return data.calls || [];
   }
 
   /**
-   * Get transcripts for calls.
-   * POST /v2/calls/transcript
+   * Transcripts for calls. POST /v2/calls/transcript.
+   * Auto-paginates over Gong's cursor in case the response is chunked.
    */
   async getTranscripts(callIds: string[]): Promise<GongCallTranscript[]> {
-    const data = await this.request<{
-      requestId: string;
-      records: {
-        totalRecords: number;
-        currentPageSize: number;
-        cursor?: string;
-      };
-      callTranscripts: GongCallTranscript[];
-    }>("POST", "/calls/transcript", {
-      filter: { callIds },
-    });
-
-    return data.callTranscripts || [];
+    const all: GongCallTranscript[] = [];
+    let cursor: string | undefined;
+    do {
+      const body: Record<string, unknown> = { filter: { callIds } };
+      if (cursor) body.cursor = cursor;
+      const data = await this.request<{
+        records?: { cursor?: string };
+        callTranscripts?: GongCallTranscript[];
+      }>("POST", "/calls/transcript", body);
+      all.push(...(data.callTranscripts || []));
+      cursor = data.records?.cursor;
+    } while (cursor);
+    return all;
   }
 
   /**
-   * List all calls in a date range, handling pagination automatically.
+   * List all users, auto-paginating. GET /v2/users.
    */
-  async listAllCalls(
-    fromDateTime: string,
-    toDateTime: string
-  ): Promise<GongCall[]> {
-    const allCalls: GongCall[] = [];
+  async listUsers(maxPages = 10): Promise<GongUser[]> {
+    const all: GongUser[] = [];
     let cursor: string | undefined;
-
+    let page = 0;
     do {
-      const page = await this.listCalls(fromDateTime, toDateTime, cursor);
-      allCalls.push(...page.calls);
-      cursor = page.cursor;
-    } while (cursor);
-
-    return allCalls;
+      const params = new URLSearchParams();
+      if (cursor) params.set("cursor", cursor);
+      const qs = params.toString();
+      const data = await this.request<{
+        records?: { cursor?: string };
+        users?: GongUser[];
+      }>("GET", `/users${qs ? `?${qs}` : ""}`);
+      all.push(...(data.users || []));
+      cursor = data.records?.cursor;
+      page++;
+    } while (cursor && page < maxPages);
+    return all;
   }
 }
